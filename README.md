@@ -350,6 +350,40 @@ file sets the variable inside the container. See
 **[running notebooks](docs/running-notebooks.md)** for the first-notebook walkthrough, case-study
 pipelines, Papermill parameters, and the experiment workflow.
 
+### MNQ objective strategy research workflow
+
+The MNQ objective-strategy validation notebook uses deterministic in-memory fixture data by
+default. Run these commands from the repository root:
+
+```bash
+# Focused configuration and fixture tests
+uv run pytest tests/research/test_config.py -q
+
+# Full MNQ research test suite
+uv run pytest tests/research -q
+
+# Headless notebook smoke execution; output is written outside the repository
+uv run jupyter nbconvert --to notebook --execute \
+  research/notebooks/mnq_objective_strategy_validation.ipynb \
+  --output-dir /tmp \
+  --output mnq_objective_strategy_validation.executed.ipynb
+```
+
+The notebook is a research-only smoke workflow. It uses synthetic fixture data unless you
+explicitly replace it with a locally normalized MNQ file, and it requires no downloads,
+credentials, broker/API access, or live market data by default. Its output does not claim
+profitability or establish live execution quality. The baseline validation report is at
+[research/reports/mnq-baseline-validation.md](research/reports/mnq-baseline-validation.md).
+
+The synthetic workflow's mechanical validation is complete, but historical MNQ validation is
+blocked: real/licensed MNQ history and an approved rollover policy are not available in this
+checkout. The MES/MGC extension gate is **NOT CLEARED**. MES or MGC work requires an appropriate
+real/licensed MNQ sample and approved rollover policy to be available first, then no lookahead
+failures, no controlled-backtest risk-limit breaches, stable results across at least three
+chronological regimes, and a holdout report covering costs and drawdown. Each instrument must
+also supply its own point value, tick size, session rules, data-quality checks, and fixed-contract
+configuration validation. No MES/MGC implementation is included here.
+
 ### Docker images
 
 Most notebooks run on the default **ml4t** image; a few need a specialized one, and each such notebook says so in its
