@@ -13,13 +13,13 @@ from what was actually generated.
 
 ``tests/test_fixture_manifest_matches_builders.py`` checks each entry of the
 manifest against a declaration and against the data on disk. What it cannot check
-is a file no declaration mentions: DATASETS reaches 150 of the 327 files the
-test-data repo carries, and 149 are named neither by a ``Dataset.owns`` nor by
-``manifest.json``. An undeclared fixture has no builder, no recorded budget and
-nothing comparing it to the datasets it has to join against - which is how the
-FNSPID news fixture came to sit entirely past the end of its own price panel
-(ml4t/agent-workspace#1116). Adding a declaration is how a fixture stops being one
-of those 149; ml4t/agent-workspace#1117 tracks the rest.
+is a file no declaration mentions, and most of the test-data repo is still in that
+state: named neither by a ``Dataset.owns`` nor by ``manifest.json``. Such a fixture
+has no builder, no recorded budget and nothing comparing it to the datasets it has
+to join against - which is how the FNSPID news fixture came to sit entirely past
+the end of its own price panel (ml4t/agent-workspace#1116). Adding a declaration is
+how a fixture leaves that state; ml4t/agent-workspace#1117 carries the running
+count and the remaining groups.
 
 It is also not a from-empty rebuild of the fixture repo: it operates on a checkout
 of ml4t/third-edition-test-data and replaces the datasets it is asked for.
@@ -1203,6 +1203,465 @@ def build_cme_futures(source: Path, output: Path) -> list[Path]:
     return written
 
 
+# --- CFTC Commitment of Traders -----------------------------------------------
+#
+# 1.2 MB for the whole directory and nothing is transformed, so the builder copies:
+# every fixture file is byte-identical to production's, and a parquet round-trip
+# through polars would change their bytes while changing nothing a reader sees.
+#
+# It copies whatever products production carries rather than a declared list,
+# because `data/futures/loader.py::list_cot_products` answers by enumerating this
+# directory: a fixture holding a subset makes that loader return a different
+# product list under CI than the one a reader gets. What is declared is the
+# minimum - the products `04_fundamental_alternative_data/08_futures_positioning`
+# loads by name - so a production directory that has lost one fails here rather
+# than shipping a fixture the notebook cannot read.
+
+COT_DIR = Path("futures") / "positioning" / "cot"
+COT_REQUIRED_PRODUCTS = ("CL", "ES", "GC")
+
+
+def build_cot(source: Path, output: Path) -> list[Path]:
+    """Copy every per-product COT parquet production carries, verbatim."""
+    source_dir = source / COT_DIR
+    products = sorted(p.stem for p in source_dir.glob("*.parquet"))
+    if missing := sorted(set(COT_REQUIRED_PRODUCTS) - set(products)):
+        raise FileNotFoundError(
+            f"Production carries no COT reports for {missing} at {source_dir}. "
+            "08_futures_positioning loads those products by name. Fetch them with "
+            f"data/futures/positioning/cot_download.py --products {','.join(missing)}."
+        )
+
+    written: list[Path] = []
+    rows = 0
+    for product in products:
+        destination = output / COT_DIR / f"{product}.parquet"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_dir / f"{product}.parquet", destination)
+        rows += pl.scan_parquet(destination).select(pl.len()).collect().item()
+        written.append(destination)
+    size = sum(path.stat().st_size for path in written) / 1e6
+    print(f"    cot/: {len(written)} products, {rows:,} rows ({size:.1f} MB), copied verbatim")
+    return written
+
+
+# --- SEC filings, XBRL fundamentals and Form 4 --------------------------------
+#
+# Four fixtures that share a producer -- `data/equities/fundamentals/` and
+# `data/equities/positioning/form4_download.py` -- and the loaders in
+# `data/equities/loader.py` that read them.
+#
+# Three are production verbatim. Production's own SEC corpora are already the size
+# a fixture wants (the sp100 reference panels are one row per filing with the text
+# attached, the XBRL panel covers 20 CIKs), so a reduction would remove rows a
+# reader can see for no saving. The fourth, the sp500 10-Q panel, is 477 symbols in
+# production and is cut to the 13 the fixture carries.
+#
+# `equities/fundamentals/xbrl/filing_dates/` is not declared here. It is
+# `xbrl_download.py`'s own HTTP cache of accession -> filing_date, written and read
+# by that script alone; no loader, notebook or test opens it. It is deleted from
+# the fixture rather than declared.
+
+SEC_10K_REFERENCE = (
+    Path("equities") / "fundamentals" / "10k" / "sp100" / "reference" / "all_10k_filings.parquet"
+)
+SEC_8K_REFERENCE = (
+    Path("equities") / "fundamentals" / "8k" / "sp100" / "reference" / "all_8k_filings.parquet"
+)
+SEC_10Q_REFERENCE = (
+    Path("equities") / "fundamentals" / "10q" / "sp500" / "reference" / "all_10q_filings.parquet"
+)
+# The 13 the fixture carries. `load_sp500_10q_mda` takes an optional symbol filter
+# and defaults to all of them, so this list is what the fixture's readers see.
+SEC_10Q_SYMBOLS = (
+    "AAPL",
+    "AMZN",
+    "GOOG",
+    "GOOGL",
+    "JNJ",
+    "MSFT",
+    "NVDA",
+    "PG",
+    "TSLA",
+    "UNH",
+    "V",
+    "WMT",
+    "XOM",
+)
+XBRL_FUNDAMENTALS = Path("equities") / "fundamentals" / "xbrl" / "fundamentals.parquet"
+FORM4_DIR = Path("equities") / "positioning" / "form4"
+
+
+def _copy_verbatim(source: Path, output: Path, relative: Path, download: str) -> Path:
+    """Copy one production file into the fixture, unchanged."""
+    src = source / relative
+    if not src.exists():
+        raise FileNotFoundError(f"{relative} not found at {src}. Fetch it with {download}.")
+    dst = output / relative
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dst)
+    return dst
+
+
+def build_sec_filing_references(source: Path, output: Path) -> list[Path]:
+    """Copy the sp100 10-K and 8-K panels whole; cut the sp500 10-Q panel to 13 symbols."""
+    download = "data/equities/fundamentals/filings_download.py"
+    written: list[Path] = []
+    for relative, form in ((SEC_10K_REFERENCE, "10-K"), (SEC_8K_REFERENCE, "8-K")):
+        dst = _copy_verbatim(source, output, relative, f"{download} --form {form} --universe sp100")
+        frame = pl.read_parquet(dst)
+        print(
+            f"    {relative.name}: {frame.height:,} filings, "
+            f"{frame['symbol'].n_unique()} symbols, copied verbatim"
+        )
+        written.append(dst)
+
+    src = source / SEC_10Q_REFERENCE
+    if not src.exists():
+        raise FileNotFoundError(
+            f"{SEC_10Q_REFERENCE} not found at {src}. Fetch it with "
+            f"{download} --form 10-Q --universe sp500."
+        )
+    frame = pl.read_parquet(src)
+    missing = sorted(set(SEC_10Q_SYMBOLS) - set(frame["symbol"].unique().to_list()))
+    if missing:
+        raise ValueError(
+            f"Production's sp500 10-Q panel carries no filings for {missing}. The fixture "
+            "declares them, so a narrower panel would ship a fixture short of its own budget."
+        )
+    reduced = frame.filter(pl.col("symbol").is_in(SEC_10Q_SYMBOLS))
+    dst = output / SEC_10Q_REFERENCE
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    reduced.write_parquet(dst)
+    print(
+        f"    {SEC_10Q_REFERENCE.name}: {reduced.height:,} of {frame.height:,} filings, "
+        f"{reduced['symbol'].n_unique()} of {frame['symbol'].n_unique()} symbols"
+    )
+    written.append(dst)
+    return written
+
+
+def build_xbrl_fundamentals(source: Path, output: Path) -> list[Path]:
+    """Copy the XBRL quarterly fundamentals panel verbatim."""
+    dst = _copy_verbatim(
+        source, output, XBRL_FUNDAMENTALS, "data/equities/fundamentals/xbrl_download.py"
+    )
+    frame = pl.read_parquet(dst)
+    print(
+        f"    fundamentals.parquet: {frame.height:,} rows, {frame['symbol'].n_unique()} symbols, "
+        "copied verbatim"
+    )
+    return [dst]
+
+
+def build_form4(source: Path, output: Path) -> list[Path]:
+    """Copy every Form 4 XML production carries, verbatim.
+
+    `04_fundamental_alternative_data/03_sec_form4_insider_transactions` enumerates
+    the ticker directories rather than naming one, so the fixture is whatever
+    production holds; it raises if that is nothing.
+    """
+    source_dir = source / FORM4_DIR
+    filings = sorted(source_dir.rglob("*.xml")) if source_dir.is_dir() else []
+    if not filings:
+        raise FileNotFoundError(
+            f"No Form 4 filings under {source_dir}. Fetch them with "
+            "data/equities/positioning/form4_download.py --ticker TSLA --count 20."
+        )
+    written: list[Path] = []
+    for filing in filings:
+        dst = output / FORM4_DIR / filing.relative_to(source_dir)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(filing, dst)
+        written.append(dst)
+    tickers = sorted({filing.relative_to(source_dir).parts[0] for filing in filings})
+    print(f"    form4/: {len(written)} filings for {', '.join(tickers)}, copied verbatim")
+    return written
+
+
+# --- NASDAQ ITCH messages and the ES individual contracts ---------------------
+#
+# Four fixture files under paths that `tests/generate_test_microstructure.py`
+# otherwise fills with synthetic data. They were widened from production on
+# 2026-05-06 (ES, for the `timestamp`/`tenor`/`product` schema) and 2026-05-17
+# (ITCH `A`, `P`, `R`, to unblock 08_financial_features/02_microstructure_features),
+# and the generator was not told, so for four months the two producers wrote
+# different content to the same paths and whichever ran last won. The generator now
+# names them in its `PRODUCTION_SOURCED` set and refuses them; they are declared here.
+
+ITCH_MESSAGES = Path("equities") / "market" / "microstructure" / "nasdaq_itch" / "messages"
+# The five the fixture carries. Widening beyond them costs little, but
+# 02_microstructure_features asserts >= 100 AAPL trade rows and reads three of these
+# by name, so narrowing is what would break.
+ITCH_SYMBOLS = ("AAPL", "GOOGL", "MSFT", "NVDA", "TSLA")
+ITCH_ROWS_PER_SYMBOL = 500
+# `R` is the stock directory: one row per symbol, so it is taken whole rather than
+# capped. `A` and `P` are the message types a notebook reads.
+ITCH_MESSAGE_TYPES = ("A", "P", "R")
+
+ES_INDIVIDUAL = Path("futures") / "market" / "individual" / "ES" / "data.parquet"
+
+
+def build_nasdaq_itch_messages(source: Path, output: Path) -> list[Path]:
+    """Take the first ``ITCH_ROWS_PER_SYMBOL`` messages per symbol from production.
+
+    Production stores each message type as 43 parquet parts in timestamp order. The
+    reduction reads them in that order, keeps the head per symbol, and re-sorts by
+    timestamp, which is what makes the result a contiguous early slice of the
+    trading day rather than a sample scattered across it: a limit-order-book reader
+    needs the adds that precede an event, and a random sample supplies neither side.
+
+    `R` has one row per symbol and is taken whole.
+    """
+    written: list[Path] = []
+    for message_type in ITCH_MESSAGE_TYPES:
+        source_dir = source / ITCH_MESSAGES / message_type
+        parts = sorted(source_dir.glob("part-*.parquet"))
+        if not parts:
+            raise FileNotFoundError(
+                f"No ITCH {message_type} messages at {source_dir}. Parse them with "
+                "data/equities/market/microstructure/nasdaq_itch_download.py."
+            )
+        frame = pl.scan_parquet(parts).filter(pl.col("stock").is_in(ITCH_SYMBOLS)).collect()
+        missing = sorted(set(ITCH_SYMBOLS) - set(frame["stock"].unique().to_list()))
+        if missing:
+            raise ValueError(
+                f"Production ITCH {message_type} carries no messages for {missing}. "
+                "The fixture's consumers read those symbols by name."
+            )
+        columns = frame.columns
+        if message_type != "R":
+            frame = (
+                frame.group_by("stock", maintain_order=True)
+                .head(ITCH_ROWS_PER_SYMBOL)
+                .select(columns)
+                .sort("timestamp")
+            )
+        destination = output / ITCH_MESSAGES / message_type / "part-000000.parquet"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        frame.write_parquet(destination)
+        print(f"    {message_type}/: {frame.height:,} rows, {frame['stock'].n_unique()} symbols")
+        written.append(destination)
+    return written
+
+
+def build_individual_futures_es(source: Path, output: Path) -> list[Path]:
+    """Copy the production ES individual-contract bars verbatim.
+
+    290 KB for ten years across every listed contract month. A reduction would have
+    to choose which months to keep, and the notebook that reads this file rolls
+    between them, so dropping any is dropping the thing it demonstrates.
+
+    CL and NQ sit beside this file and are synthetic, from
+    `tests/generate_test_microstructure.py`; production carries neither.
+    """
+    src = source / ES_INDIVIDUAL
+    if not src.exists():
+        raise FileNotFoundError(
+            f"ES individual contracts not found at {src}. Fetch them with "
+            "data/futures/market/cme_download.py."
+        )
+    dst = output / ES_INDIVIDUAL
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dst)
+    rows = pl.scan_parquet(dst).select(pl.len()).collect().item()
+    print(
+        f"    ES/data.parquet: {rows:,} rows ({dst.stat().st_size / 1e6:.1f} MB), copied verbatim"
+    )
+    return [dst]
+
+
+# --- published factor returns, FRED macro and on-chain TVL ---------------------
+#
+# Four sources that are downloaded rather than derived, total about 9 MB against a
+# 529 MB fixture, so all four builders copy: every fixture file is byte-identical to
+# production's, and a parquet round-trip through polars would change their bytes
+# while changing nothing a reader sees.
+#
+# Each copies whatever production carries rather than a declared list, and declares
+# the MINIMUM instead -- the files a loader can name or a notebook opens by path. A
+# production directory that has lost one fails here rather than shipping a fixture a
+# notebook cannot read, and one that has gained a file ships it rather than silently
+# omitting it.
+#
+# What this replaces is not a smaller builder. It is none: all 51 files were in the
+# test-data repo with no producer, so nothing regenerated them from production and
+# nothing said what they were meant to contain. The evidence they had drifted is in
+# the row counts. Every AQR parquet the fixture carried was 2 to 64 rows SHORT of
+# production, which is what an old snapshot looks like, and the FRED panel had drifted
+# in both directions at once -- `fred_macro_initial_release` 49 rows AHEAD of
+# production and `fred_macro_raw` 27,132 rows behind.
+
+FF_DIR = Path("factors") / "fama-french"
+AQR_DIR = Path("factors") / "aqr"
+MACRO_DIR = Path("macro")
+ONCHAIN_DIR = Path("crypto") / "onchain"
+
+# The six `data/factors/loader.py::load_ff_factors` can name. Its two Literal
+# parameters are the whole reachable set, so this is read off the signature rather
+# than maintained: dataset in (ff3, ff5, mom) x frequency in (daily, monthly). The
+# other four the fixture carries -- bp_me, ind_5, port_size, ff3_developed -- are
+# reachable only by opening the path directly and are copied, not required.
+FF_REQUIRED = tuple(
+    f"{dataset}_{frequency}.parquet"
+    for dataset in ("ff3", "ff5", "mom")
+    for frequency in ("daily", "monthly")
+)
+
+# The four `load_aqr_factors` maps by name, plus the two that 01_process_is_edge/
+# factor_regimes and 17_portfolio_construction/05_factor_allocation_evidence open by
+# path. The rest are copied and not required.
+AQR_REQUIRED = (
+    "qmj_factors.parquet",
+    "bab_factors.parquet",
+    "hml_devil.parquet",
+    "vme_factors.parquet",
+    "century_premia.parquet",
+    "tsmom.parquet",
+)
+
+# `fred_macro.parquet` is the aligned panel three teaching notebooks read by path;
+# the raw and metadata files are what `data/macro/loader.py` names in its outputs.
+#
+# `fred_macro_initial_release.parquet` is here because it comes from a DIFFERENT
+# download script - `download_alfred.py`, not `download.py` - so a production tree can
+# hold every other file here and not this one. `04_fundamental_alternative_data/
+# 07_macro_data_alignment` calls `load_macro_initial_release()` unconditionally, and
+# without it that notebook raises where the build would have succeeded. The three not
+# required - the two dictionaries and `initial_release_raw` - are copied because
+# production carries them and read by nothing in this repo.
+MACRO_REQUIRED = (
+    "fred_macro.parquet",
+    "fred_macro_raw.parquet",
+    "fred_macro_metadata.parquet",
+    "fred_macro_initial_release.parquet",
+)
+
+# 04_fundamental_alternative_data reads the per-chain files through an f-string over
+# the chain name, so the four chains are required by construction, not by choice.
+ONCHAIN_REQUIRED = (
+    "defillama_tvl_total.parquet",
+    "defillama_tvl_arbitrum.parquet",
+    "defillama_tvl_bsc.parquet",
+    "defillama_tvl_ethereum.parquet",
+    "defillama_tvl_solana.parquet",
+    "coingecko_ethereum.parquet",
+)
+
+
+def _copy_flat_directory(
+    source: Path,
+    output: Path,
+    directory: Path,
+    required: tuple[str, ...],
+    patterns: tuple[str, ...],
+    label: str,
+    fetch_hint: str,
+) -> list[Path]:
+    """Copy production's files for one downloaded source, verbatim, and check the minimum.
+
+    Args:
+        source: Production data root.
+        output: Fixture data root.
+        directory: Path under both roots holding this source's files.
+        required: File names a loader can name or a notebook opens by path. A
+            production directory missing one of these fails rather than shipping a
+            fixture that cannot satisfy it.
+        patterns: Globs naming what belongs to this source. Deliberately not ``*``:
+            the AQR directory also holds a ``source/`` tree of the original 15
+            spreadsheets, 95 MB that no loader reads.
+        label: Printed name for the build summary.
+        fetch_hint: What to run when a required file is missing.
+
+    Returns:
+        The fixture paths written.
+
+    Raises:
+        FileNotFoundError: If production carries none of this source, or is missing a
+            required file.
+    """
+    source_dir = source / directory
+    if not source_dir.is_dir():
+        raise FileNotFoundError(f"Production carries no {label} at {source_dir}. {fetch_hint}")
+
+    names = sorted({path.name for pattern in patterns for path in source_dir.glob(pattern)})
+    if missing := sorted(set(required) - set(names)):
+        raise FileNotFoundError(
+            f"Production is missing {label} files {missing} at {source_dir}. {fetch_hint}"
+        )
+
+    written: list[Path] = []
+    for name in names:
+        destination = output / directory / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_dir / name, destination)
+        written.append(destination)
+    size = sum(path.stat().st_size for path in written) / 1e6
+    print(f"    {label}: {len(written)} files ({size:.1f} MB), copied verbatim")
+    return written
+
+
+def build_fama_french_factors(source: Path, output: Path) -> list[Path]:
+    """Copy every Fama-French factor parquet production carries, verbatim."""
+    return _copy_flat_directory(
+        source,
+        output,
+        FF_DIR,
+        FF_REQUIRED,
+        ("*.parquet",),
+        "fama-french/",
+        "Fetch them with data/factors/ff_download.py.",
+    )
+
+
+def build_aqr_factors(source: Path, output: Path) -> list[Path]:
+    """Copy AQR's published factor parquets and their metadata, verbatim.
+
+    Not the ``source/`` tree beside them: those are the 15 original spreadsheets the
+    parquets were converted from, 95 MB that no loader opens.
+    """
+    return _copy_flat_directory(
+        source,
+        output,
+        AQR_DIR,
+        AQR_REQUIRED,
+        ("*.parquet", "metadata.json"),
+        "aqr/",
+        "Fetch them with data/factors/aqr_download.py.",
+    )
+
+
+def build_fred_macro(source: Path, output: Path) -> list[Path]:
+    """Copy the FRED macro panels production carries, verbatim.
+
+    Only the ``fred_macro*`` files. The production directory also holds the download
+    scripts, a loader, a README and two profile JSONs, none of which a notebook reads
+    through ``ML4T_DATA_PATH``.
+    """
+    return _copy_flat_directory(
+        source,
+        output,
+        MACRO_DIR,
+        MACRO_REQUIRED,
+        ("fred_macro*.parquet",),
+        "macro/",
+        "Fetch them with data/macro/download.py and data/macro/download_alfred.py.",
+    )
+
+
+def build_crypto_onchain(source: Path, output: Path) -> list[Path]:
+    """Copy the DefiLlama TVL and CoinGecko on-chain series, verbatim."""
+    return _copy_flat_directory(
+        source,
+        output,
+        ONCHAIN_DIR,
+        ONCHAIN_REQUIRED,
+        ("*.parquet",),
+        "onchain/",
+        "Fetch them with data/crypto/onchain/download.py.",
+    )
+
+
 DATASETS: tuple[Dataset, ...] = (
     Dataset(
         name="etfs",
@@ -1368,6 +1827,128 @@ DATASETS: tuple[Dataset, ...] = (
         # Named individually, not as the 13f/ directory: bulk/ sits beside them and
         # is produced elsewhere, so --clean must not take it.
         owns=tuple(Path("equities") / "positioning" / "13f" / name for name in _13F_FILES),
+        budget={"subsample": "none"},
+    ),
+    Dataset(
+        name="cot",
+        description=(
+            "the whole production CFTC Commitment of Traders directory, every "
+            "product intact, so list_cot_products() enumerates under CI what it "
+            "enumerates for a reader"
+        ),
+        build=build_cot,
+        owns=(COT_DIR,),
+        budget={"subsample": "none"},
+    ),
+    Dataset(
+        name="sec_filing_references",
+        description=(
+            "the whole production sp100 10-K and 8-K reference panels, and the "
+            f"sp500 10-Q panel cut to {len(SEC_10Q_SYMBOLS)} symbols"
+        ),
+        build=build_sec_filing_references,
+        # Named individually: each sits in a reference/ directory alongside the
+        # per-filing artifacts filings_download.py writes, which --clean must not take.
+        owns=(SEC_10K_REFERENCE, SEC_8K_REFERENCE, SEC_10Q_REFERENCE),
+        budget={"sp100_10k_8k": "none", "sp500_10q_symbols": list(SEC_10Q_SYMBOLS)},
+        entities={SEC_10Q_REFERENCE.as_posix(): ("symbol", len(SEC_10Q_SYMBOLS))},
+    ),
+    Dataset(
+        name="xbrl_fundamentals",
+        description=(
+            "the whole production XBRL quarterly fundamentals panel, which covers "
+            "20 CIKs and is already fixture-sized"
+        ),
+        build=build_xbrl_fundamentals,
+        # Named individually: filing_dates/ sits beside it and is xbrl_download.py's
+        # own HTTP cache, not a fixture.
+        owns=(XBRL_FUNDAMENTALS,),
+        budget={"subsample": "none"},
+    ),
+    Dataset(
+        name="form4",
+        description=(
+            "every Form 4 XML production carries, so the notebook that enumerates "
+            "the ticker directories sees under CI what a reader sees"
+        ),
+        build=build_form4,
+        owns=(FORM4_DIR,),
+        budget={"subsample": "none"},
+    ),
+    Dataset(
+        name="nasdaq_itch_messages",
+        description=(
+            f"the first {ITCH_ROWS_PER_SYMBOL} production ITCH add-order and trade "
+            f"messages per symbol for {len(ITCH_SYMBOLS)} symbols, plus their stock "
+            "directory rows, as a contiguous slice of the open rather than a sample"
+        ),
+        build=build_nasdaq_itch_messages,
+        # Named individually, not as the messages/ directory: the other seven message
+        # types there are synthetic and come from tests/generate_test_microstructure.py,
+        # so --clean must not take them.
+        owns=tuple(
+            ITCH_MESSAGES / message_type / "part-000000.parquet"
+            for message_type in ITCH_MESSAGE_TYPES
+        ),
+        budget={
+            "symbols": list(ITCH_SYMBOLS),
+            "rows_per_symbol": ITCH_ROWS_PER_SYMBOL,
+            "message_types": list(ITCH_MESSAGE_TYPES),
+        },
+        entities={
+            (ITCH_MESSAGES / message_type / "part-000000.parquet").as_posix(): (
+                "stock",
+                len(ITCH_SYMBOLS),
+            )
+            for message_type in ITCH_MESSAGE_TYPES
+        },
+    ),
+    Dataset(
+        name="individual_futures_es",
+        description=(
+            "the whole production ES individual-contract panel, small enough to "
+            "ship intact and carrying every contract month the roll demonstrates"
+        ),
+        build=build_individual_futures_es,
+        # Named individually: CL and NQ sit in the same directory and are synthetic.
+        owns=(ES_INDIVIDUAL,),
+        budget={"subsample": "none"},
+    ),
+    Dataset(
+        name="fama_french_factors",
+        description=(
+            "every Fama-French factor parquet production carries, copied verbatim, "
+            f"with the {len(FF_REQUIRED)} load_ff_factors() can name required"
+        ),
+        build=build_fama_french_factors,
+        owns=(FF_DIR,),
+        budget={"subsample": "none"},
+    ),
+    Dataset(
+        name="aqr_factors",
+        description=(
+            "AQR's published factor parquets and their metadata, copied verbatim, "
+            "without the source/ spreadsheets they were converted from"
+        ),
+        build=build_aqr_factors,
+        owns=(AQR_DIR,),
+        budget={"subsample": "none"},
+    ),
+    Dataset(
+        name="fred_macro",
+        description=(
+            "the FRED macro panels production carries - aligned, raw, initial-release "
+            "and their dictionaries and metadata - copied verbatim"
+        ),
+        build=build_fred_macro,
+        owns=(MACRO_DIR,),
+        budget={"subsample": "none"},
+    ),
+    Dataset(
+        name="crypto_onchain",
+        description="the DefiLlama TVL and CoinGecko on-chain series, copied verbatim",
+        build=build_crypto_onchain,
+        owns=(ONCHAIN_DIR,),
         budget={"subsample": "none"},
     ),
 )
